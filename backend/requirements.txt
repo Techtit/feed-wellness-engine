@@ -1,0 +1,14 @@
+flask>=3.0.0
+gunicorn>=21.2.0
+
+# HuggingFace API client (official library, handles routing + auth)
+huggingface_hub>=0.20.0
+requests>=2.31.0
+Pillow>=10.1.0
+numpy>=1.26.0
+
+# Database
+supabase>=2.3.0
+
+# Utilities
+python-dotenv>=1.0.0

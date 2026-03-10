@@ -1,0 +1,48 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
+venv/
+.venv/
+env/
+.env/
+
+# Environment variables (secrets)
+backend/.env
+.env
+
+# Test artifacts
+backend/test_result.json
+backend/test_images/
+
+# Storage (runtime uploads)
+backend/storage/
+
+# IDEs
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Android build artifacts
+android/.gradle/
+android/app/build/
+android/local.properties
+android/*.keystore
+android/gradle/wrapper/gradle-wrapper.jar
+
+# Node (if any)
+node_modules/
