@@ -6,23 +6,23 @@ Endpoints:
     POST /api/analyze  — Full ML pipeline analysis of a feed session
     GET  /health       — Health check
 
-Pipeline flow (HuggingFace Inference API — zero local model loading):
+Pipeline flow (Hybrid: Gemini API + Local PyTorch):
     1. Decode base64 screenshots → PIL Images
-    2. Image captioning (BLIP) → extracted text per post
-    3. Post type classification (CLIP zero-shot) per post
-    4. Toxicity scoring (toxic-bert) per post
-    5. Sentiment scoring (roberta) per post
-    6. Text embedding (sentence-transformers) per post
-    7. Aggregate feed embedding (dwell-weighted mean)
-    8. Project behavior scores
-    9. Compute wellness index
-    10. Generate recommendation
-    11. Store in Supabase
-    12. Return WellnessReport
+    2. Gemini 1.5 Flash: Caption + Post Type Classification (API)
+    3. Local toxic-bert: Toxicity scoring (PyTorch)
+    4. Local VADER: Sentiment scoring (rule-based)
+    5. Local MiniLM: Text embedding (PyTorch)
+    6. Aggregate feed embedding (dwell-weighted mean)
+    7. Project behavior scores
+    8. Compute wellness index
+    9. Generate recommendation
+    10. Store in Supabase
+    11. Return WellnessReport
 
 Privacy:
-    - Screenshots are sent to HuggingFace API for processing only
+    - Screenshots are sent to Gemini API for captioning only
     - PIL Images are dereferenced after processing
+    - Toxicity, sentiment, and embeddings run 100% locally
     - Only aggregated scores are stored in Supabase
 """
 
@@ -54,7 +54,7 @@ def health():
 def analyze():
     """
     Full ML pipeline analysis of a feed session.
-    All ML inference via HuggingFace Inference API — zero local models.
+    Hybrid architecture: Gemini API for vision + Local models for NLP.
 
     Expects JSON body matching AnalyzeRequest schema.
     Returns JSON matching AnalyzeResponse schema.
@@ -76,65 +76,54 @@ def analyze():
         logger.info(f"Analyzing session {data['session_id']}: {len(posts)} posts")
 
         import numpy as np
-        from models import hf_client
+        from models.gemini_client import analyze_image, decode_base64_image
+        from models.embedding_engine import extract_text_embeddings_batch
+        from models.vector_scorer import score_batch
 
-        # Post type labels
-        POST_CATEGORIES = ["video", "reel", "static image", "text post", "meme", "news article"]
-        CATEGORY_LABELS = ["video", "reel", "static", "text", "meme", "news"]
-        label_map = dict(zip(POST_CATEGORIES, CATEGORY_LABELS))
-
-        # ── Per-post processing ─────────────────────────────────
-        all_text_embeddings = []
+        # ── Per-post processing (Phase 1: Captions) ────────────────
         all_dwell_times = []
-        all_toxicity_scores = []
-        all_positivity_scores = []
-        all_emotion_scores = []
         all_post_types = []
-        per_post_data = []  # Rich per-post breakdown for insights
-
+        extracted_texts = []
+        gemini_results = []
+        
         for i, post in enumerate(posts):
             logger.info(f"Processing post {i+1}/{len(posts)}...")
-
-            # Decode screenshot
-            image = hf_client.decode_base64_image(post["image_base64"])
-
-            # Image captioning → extracted text
-            extracted_text = hf_client.caption_image(image)
-
-            # Post type classification (CLIP zero-shot)
-            raw_dist = hf_client.classify_image(image, POST_CATEGORIES)
-            post_type_dist = {label_map.get(k, k): v for k, v in raw_dist.items()}
-
-            # PRIVACY: Done with image
+            image = decode_base64_image(post["image_base64"])
+            gemini_result = analyze_image(image)
+            
+            extracted_texts.append(gemini_result["caption"])
+            gemini_results.append(gemini_result)
+            all_dwell_times.append(post["dwell_time_seconds"])
+            all_post_types.append(gemini_result["post_type"])
             del image
 
-            # Toxicity scoring
-            toxicity = hf_client.score_toxicity(extracted_text)
+        # ── Batch Embedding & Scoring (Phase 2) ──────────────────
+        logger.info("Extracting batch text embeddings...")
+        all_text_embeddings = extract_text_embeddings_batch(extracted_texts)
+        
+        logger.info("Computing zero-shot vector scores...")
+        batch_scores = score_batch(all_text_embeddings)
+        
+        all_toxicity_scores = batch_scores["toxicity"]
+        all_positivity_scores = batch_scores["positivity"]
+        all_emotion_scores = batch_scores["emotional_intensity"]
 
-            # Sentiment scoring
-            positivity, emotional_intensity = hf_client.score_sentiment(extracted_text)
+        # ── Per-post insights buildup ────────────────────────────
+        per_post_data = []
+        for i, post in enumerate(posts):
+            toxicity = all_toxicity_scores[i] if i < len(all_toxicity_scores) else 0.0
+            positivity = all_positivity_scores[i] if i < len(all_positivity_scores) else 0.5
+            emotional_intensity = all_emotion_scores[i] if i < len(all_emotion_scores) else 0.5
 
-            # Text embedding
-            text_emb = hf_client.extract_text_embedding(extracted_text)
-
-            # Collect results
-            all_text_embeddings.append(text_emb)
-            all_dwell_times.append(post["dwell_time_seconds"])
-            all_toxicity_scores.append(toxicity)
-            all_positivity_scores.append(positivity)
-            all_emotion_scores.append(emotional_intensity)
-            all_post_types.append(post_type_dist)
-
-            # Per-post detail for insights
             per_post_data.append({
                 "post_id": post.get("post_id", f"post-{i+1}"),
-                "caption": extracted_text,
-                "post_type": post_type_dist,
-                "dominant_type": max(post_type_dist, key=post_type_dist.get) if post_type_dist else "unknown",
-                "toxicity": round(toxicity, 4),
-                "positivity": round(positivity, 4),
-                "emotional_intensity": round(emotional_intensity, 4),
-                "dwell_time": post["dwell_time_seconds"]
+                "caption": extracted_texts[i],
+                "post_type": all_post_types[i],
+                "dominant_type": gemini_results[i]["dominant_type"],
+                "toxicity": round(float(toxicity), 4),
+                "positivity": round(float(positivity), 4),
+                "emotional_intensity": round(float(emotional_intensity), 4),
+                "dwell_time": all_dwell_times[i]
             })
 
         # ── Feed-level processing ───────────────────────────────
@@ -191,30 +180,23 @@ def analyze():
 
         # Models used in this analysis
         models_used = {
-            "image_captioning": {
-                "model": "Salesforce/blip-image-captioning-base",
-                "purpose": "Extracts text descriptions from post screenshots",
-                "source": "HuggingFace Inference API"
+            "image_captioning_and_classification": {
+                "model": "Google Gemini 1.5 Flash",
+                "purpose": "Extracts captions and classifies post type from screenshots",
+                "source": "Google Gemini API",
+                "runs_on": "cloud"
             },
-            "post_classification": {
-                "model": "openai/clip-vit-base-patch32",
-                "purpose": "Zero-shot classification into video/reel/static/text/meme/news",
-                "source": "HuggingFace Inference API"
-            },
-            "toxicity_detection": {
-                "model": "unitary/toxic-bert",
-                "purpose": "Scores text toxicity on 0-1 scale",
-                "source": "HuggingFace Inference API"
-            },
-            "sentiment_analysis": {
-                "model": "cardiffnlp/twitter-roberta-base-sentiment-latest",
-                "purpose": "Detects positivity and emotional intensity",
-                "source": "HuggingFace Inference API"
+            "toxicity_and_sentiment_scoring": {
+                "model": "Zero-Shot Vector Similarity (MiniLM-L6-v2)",
+                "purpose": "Computes toxicity and sentiment via vector distance",
+                "source": "SentenceTransformers (local)",
+                "runs_on": "server (PyTorch)"
             },
             "text_embedding": {
                 "model": "sentence-transformers/all-MiniLM-L6-v2",
                 "purpose": "384-dim text embedding for feed aggregation",
-                "source": "HuggingFace Inference API"
+                "source": "SentenceTransformers (local)",
+                "runs_on": "server (PyTorch)"
             }
         }
 

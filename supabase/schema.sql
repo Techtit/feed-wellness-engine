@@ -1,6 +1,9 @@
 -- Feed Wellness Engine — Supabase Schema
 -- Run this in Supabase SQL Editor
 
+-- Enable pgvector for zero-shot vector similarity matching
+CREATE EXTENSION IF NOT EXISTS vector;
+
 -- Session-level wellness reports
 CREATE TABLE IF NOT EXISTS wellness_sessions (
     id UUID DEFAULT gen_random_uuid() PRIMARY KEY,

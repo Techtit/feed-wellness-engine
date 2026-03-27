@@ -30,7 +30,7 @@ def aggregate_feed(
     Returns:
         Weighted mean embedding vector (same dim as inputs)
     """
-    if not embeddings:
+    if len(embeddings) == 0:
         raise ValueError("Cannot aggregate empty embedding list")
 
     # Cap at max_posts — take the ones with highest dwell time
