@@ -1,17 +1,8 @@
 flask>=3.0.0
 gunicorn>=21.2.0
 
-# Google Gemini API (for vision tasks)
+# Google Gemini API (for vision + NLP unified tasks)
 google-generativeai>=0.8.0
-
-# Local NLP models (PyTorch - CPU optimized for Railway)
---extra-index-url https://download.pytorch.org/whl/cpu
-transformers>=4.36.0
-sentence-transformers>=2.3.0
-torch>=2.1.0
-
-# Sentiment analysis (VADER — Replaced by Vector Scoring)
-# vaderSentiment removed
 
 # Image processing
 Pillow>=10.1.0

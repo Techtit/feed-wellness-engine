@@ -75,141 +75,118 @@ def analyze():
 
         logger.info(f"Analyzing session {data['session_id']}: {len(posts)} posts")
 
-        import numpy as np
-        from models.gemini_client import analyze_image, decode_base64_image
-        from models.embedding_engine import extract_text_embeddings_batch
-        from models.vector_scorer import score_batch
-
-        # ── Per-post processing (Phase 1: Captions) ────────────────
+        from models.gemini_client import analyze_collage, decode_base64_image
+        from models.collage_builder import build_collage
+        from models.hf_client import caption_image
+        # --- DEBUG ENV VARS (Safe key dump) ---
+        env_keys = list(os.environ.keys())
+        logger.info(f"Loaded System Env Keys: {env_keys}")
+        
+        # ── Decode & Prepare Images ─────────────────────────────────
         all_dwell_times = []
-        all_post_types = []
-        extracted_texts = []
-        gemini_results = []
+        pil_images = []
         
         for i, post in enumerate(posts):
-            logger.info(f"Processing post {i+1}/{len(posts)}...")
-            image = decode_base64_image(post["image_base64"])
-            gemini_result = analyze_image(image)
+            image_b64 = post.get("image_base64")
             
-            extracted_texts.append(gemini_result["caption"])
-            gemini_results.append(gemini_result)
-            all_dwell_times.append(post["dwell_time_seconds"])
-            all_post_types.append(gemini_result["post_type"])
-            del image
+            if image_b64:
+                # Normal screenshot post
+                image = decode_base64_image(image_b64)
+            else:
+                # Text-only post (e.g. accessibility scraping fallback)
+                text_content = post.get("extracted_text", "Unknown Text Content")
+                # Create a synthetic image to keep array lengths matching for Gemini grid
+                from PIL import Image, ImageDraw
+                image = Image.new('RGB', (400, 400), color=(30, 30, 30))
+                draw = ImageDraw.Draw(image)
+                # Just draw the text roughly in the middle so Gemini can read it visually
+                draw.text((20, 20), text_content[:500], fill=(255, 255, 255))
 
-        # ── Batch Embedding & Scoring (Phase 2) ──────────────────
-        logger.info("Extracting batch text embeddings...")
-        all_text_embeddings = extract_text_embeddings_batch(extracted_texts)
+            pil_images.append(image)
+            all_dwell_times.append(float(post.get("dwell_time_seconds", 0.0)))
+
+        logger.info(f"Stitching {len(pil_images)} images into collage...")
+        collage = build_collage(pil_images)
+
+        # ── Auxiliary BLIP API Call ─────────────────────────────────
+        logger.info("Fetching auxiliary BLIP caption from HF API...")
+        blip_context = caption_image(collage)
+
+        # ── Gemini Grid Analysis ────────────────────────────────────
+        logger.info("Executing Gemini Grid Collage Analysis...")
+        gemini_result = analyze_collage(collage, aux_context=blip_context)
         
-        logger.info("Computing zero-shot vector scores...")
-        batch_scores = score_batch(all_text_embeddings)
+        summary = gemini_result.get("summary", {})
+        cells = gemini_result.get("cells", [])
+
+        # ── Metric Translation (Grid -> Android Schema) ─────────────
+        # Convert 1-10 quality score to 0-100 wellness index
+        quality_score = float(summary.get("screen_time_quality_score", 5))
+        wellness_index = min(max(quality_score * 10.0, 0.0), 100.0)
+
+        # Synthesize float values required by Android DTO based on behavior
+        overall_behavior = summary.get("overall_behavior", "mixed").lower()
+        if "focused" in overall_behavior or "learning" in overall_behavior:
+            toxicity = 0.05
+            addictiveness = 0.2
+            positivity = 0.85
+            emotion = 0.3
+        elif "distracted" in overall_behavior or "scrolling" in overall_behavior:
+            toxicity = 0.3
+            addictiveness = 0.8
+            positivity = 0.4
+            emotion = 0.6
+        else:
+            toxicity = 0.1
+            addictiveness = 0.5
+            positivity = 0.5
+            emotion = 0.5
+
+        circadian_score = float(data["circadian_score"])
+
+        # Format Recommendation & Insights
+        recommendation = summary.get("key_pattern", "Try to limit endless scrolling and focus your intent.")
         
-        all_toxicity_scores = batch_scores["toxicity"]
-        all_positivity_scores = batch_scores["positivity"]
-        all_emotion_scores = batch_scores["emotional_intensity"]
-
-        # ── Per-post insights buildup ────────────────────────────
-        per_post_data = []
-        for i, post in enumerate(posts):
-            toxicity = all_toxicity_scores[i] if i < len(all_toxicity_scores) else 0.0
-            positivity = all_positivity_scores[i] if i < len(all_positivity_scores) else 0.5
-            emotional_intensity = all_emotion_scores[i] if i < len(all_emotion_scores) else 0.5
-
-            per_post_data.append({
-                "post_id": post.get("post_id", f"post-{i+1}"),
-                "caption": extracted_texts[i],
-                "post_type": all_post_types[i],
-                "dominant_type": gemini_results[i]["dominant_type"],
-                "toxicity": round(float(toxicity), 4),
-                "positivity": round(float(positivity), 4),
-                "emotional_intensity": round(float(emotional_intensity), 4),
-                "dwell_time": all_dwell_times[i]
-            })
-
-        # ── Feed-level processing ───────────────────────────────
-        from pipeline.feed_aggregator import aggregate_feed
-        from pipeline.behavior_projection import project_behavior_scores
-        from pipeline.wellness_calculator import compute_wellness_index
-        from pipeline.decision_engine import decide_recommendation
-
-        # Aggregate feed embedding (using text embeddings)
-        feed_embedding = aggregate_feed(all_text_embeddings, all_dwell_times)
-
-        # Project behavior scores
-        behavior_scores = project_behavior_scores(
-            feed_embedding=feed_embedding,
-            toxicity_scores=all_toxicity_scores,
-            positivity_scores=all_positivity_scores,
-            emotional_intensity_scores=all_emotion_scores,
-            dwell_times=all_dwell_times,
-            post_type_distributions=all_post_types
-        )
-
-        # Compute wellness index
-        circadian_score = data["circadian_score"]
-        wellness_index = compute_wellness_index(
-            toxicity=behavior_scores["toxicity"],
-            addictiveness=behavior_scores["addictiveness"],
-            positivity=behavior_scores["positivity"],
-            emotional_intensity=behavior_scores["emotional_intensity"],
-            circadian_score=circadian_score
-        )
-
-        # Generate recommendation
-        recommendation = decide_recommendation(
-            toxicity=behavior_scores["toxicity"],
-            addictiveness=behavior_scores["addictiveness"],
-            circadian_score=circadian_score,
-            wellness_index=wellness_index
-        )
-
-        # ── Generate insights ────────────────────────────────────
-        from pipeline.insight_engine import generate_insights
-
-        insights = generate_insights(
-            per_post_data=per_post_data,
-            behavior_scores=behavior_scores,
-            wellness_index=wellness_index,
-            circadian_score=circadian_score,
-            recommendation=recommendation,
-            session_start_utc=data["session_start_utc"],
-            session_end_utc=data["session_end_utc"]
-        )
+        insights = []
+        if summary.get("dominant_categories"):
+            cats = ", ".join(summary["dominant_categories"])
+            insights.append(f"You predominantly engaged with: {cats}")
+            
+        for cell in cells[:5]:  # Take top 5 summaries as insights
+            idx = cell.get("index", "?")
+            app = cell.get("app", "App")
+            topic = cell.get("topic", "Content")
+            sum_text = cell.get("brief_summary", "")
+            if sum_text:
+                insights.append(f"Screenshot #{idx} ({app}): {topic} - {sum_text}")
 
         # ── Build response ──────────────────────────────────────
 
-        # Models used in this analysis
         models_used = {
-            "image_captioning_and_classification": {
+            "collage_analyzer": {
                 "model": "Google Gemini 1.5 Flash",
-                "purpose": "Extracts captions and classifies post type from screenshots",
-                "source": "Google Gemini API",
-                "runs_on": "cloud"
+                "purpose": "Unified grid collage reasoning for rapid multimodal scraping",
+                "source": "Google Gemini API"
             },
-            "toxicity_and_sentiment_scoring": {
-                "model": "Zero-Shot Vector Similarity (MiniLM-L6-v2)",
-                "purpose": "Computes toxicity and sentiment via vector distance",
-                "source": "SentenceTransformers (local)",
-                "runs_on": "server (PyTorch)"
-            },
-            "text_embedding": {
-                "model": "sentence-transformers/all-MiniLM-L6-v2",
-                "purpose": "384-dim text embedding for feed aggregation",
-                "source": "SentenceTransformers (local)",
-                "runs_on": "server (PyTorch)"
+            "auxiliary_vision": {
+                "model": "Salesforce/blip-image-captioning-base",
+                "purpose": "Auxiliary captioning pass for grid elements",
+                "source": "Hugging Face Inference API"
             }
         }
 
-        # Attention span analysis
-        dwell_arr = np.array(all_dwell_times)
-        total_dwell = float(np.sum(dwell_arr))
-        avg_dwell = float(np.mean(dwell_arr))
-        max_dwell = float(np.max(dwell_arr))
-        min_dwell = float(np.min(dwell_arr))
+        # Pure Python Math for Attention Span (no numpy)
+        total_dwell = sum(all_dwell_times)
+        avg_dwell = total_dwell / len(all_dwell_times) if all_dwell_times else 0
+        max_dwell = max(all_dwell_times) if all_dwell_times else 0
+        min_dwell = min(all_dwell_times) if all_dwell_times else 0
+        
+        # Pure python standard deviation
+        dwell_variance = sum((x - avg_dwell) ** 2 for x in all_dwell_times) / len(all_dwell_times) if len(all_dwell_times) > 0 else 0
+        dwell_std_dev = dwell_variance ** 0.5
 
-        # Classify attention level per post
         attention_per_post = []
-        for i, (dwell, ppd) in enumerate(zip(all_dwell_times, per_post_data)):
+        for i, dwell in enumerate(all_dwell_times):
             if dwell >= 10:
                 level = "deep_focus"
                 label = "🔴 Deep focus — high engagement"
@@ -224,14 +201,13 @@ def analyze():
                 label = "🟢 Skimming — quick glance"
 
             attention_per_post.append({
-                "post_id": ppd.get("post_id", f"post-{i+1}"),
+                "post_id": posts[i].get("post_id", f"post-{i+1}"),
                 "dwell_seconds": round(dwell, 1),
                 "attention_level": level,
                 "attention_label": label,
                 "pct_of_session": round(dwell / total_dwell * 100, 1) if total_dwell > 0 else 0
             })
 
-        # Overall attention health
         if avg_dwell >= 10:
             attention_health = "concerning"
             attention_summary = "You're spending a lot of time per post — signs of doom-scrolling or content fixation."
@@ -250,7 +226,7 @@ def analyze():
             "avg_dwell_seconds": round(avg_dwell, 1),
             "max_dwell_seconds": round(max_dwell, 1),
             "min_dwell_seconds": round(min_dwell, 1),
-            "dwell_std_dev": round(float(np.std(dwell_arr)), 2),
+            "dwell_std_dev": round(dwell_std_dev, 2),
             "attention_health": attention_health,
             "attention_summary": attention_summary,
             "scroll_speed_posts_per_min": round(len(all_dwell_times) / max(total_dwell / 60, 0.1), 1),
@@ -259,10 +235,10 @@ def analyze():
 
         response = {
             "session_id": data["session_id"],
-            "toxicity_score": round(behavior_scores["toxicity"], 4),
-            "addictiveness_score": round(behavior_scores["addictiveness"], 4),
-            "positivity_score": round(behavior_scores["positivity"], 4),
-            "emotional_intensity": round(behavior_scores["emotional_intensity"], 4),
+            "toxicity_score": round(toxicity, 4),
+            "addictiveness_score": round(addictiveness, 4),
+            "positivity_score": round(positivity, 4),
+            "emotional_intensity": round(emotion, 4),
             "circadian_score": round(circadian_score, 4),
             "wellness_index": round(wellness_index, 2),
             "recommendation": recommendation,

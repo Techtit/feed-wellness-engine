@@ -9,7 +9,6 @@ import os
 import io
 import base64
 import logging
-import numpy as np
 from PIL import Image
 from typing import Optional, Dict, List, Any, Tuple
 
@@ -60,97 +59,6 @@ def caption_image(image: Image.Image) -> str:
     except Exception as e:
         logger.warning(f"Image captioning failed: {e}")
         return ""
-
-
-def classify_image(image: Image.Image, labels: List[str]) -> Dict[str, float]:
-    """Zero-shot image classification using CLIP."""
-    try:
-        client = get_client()
-        img_bytes = image_to_bytes(image)
-        results = client.zero_shot_image_classification(
-            img_bytes,
-            candidate_labels=labels,
-            model="openai/clip-vit-base-patch32"
-        )
-        # Results: list of objects with .label and .score
-        out = {}
-        for r in results:
-            label = r.label if hasattr(r, 'label') else r.get('label', str(r))
-            score = r.score if hasattr(r, 'score') else r.get('score', 0.0)
-            out[label] = float(score)
-        return out
-    except Exception as e:
-        logger.warning(f"Image classification failed: {e}")
-        return {label: 1.0 / len(labels) for label in labels}
-
-
-def score_toxicity(text: str) -> float:
-    """Score text toxicity using toxic-bert. Returns 0-1."""
-    if not text or not text.strip():
-        return 0.0
-    try:
-        client = get_client()
-        results = client.text_classification(text, model="unitary/toxic-bert")
-        # Results: list of objects with .label and .score attributes
-        scores = []
-        for r in results:
-            s = r.score if hasattr(r, 'score') else r.get('score', 0.0)
-            scores.append(float(s))
-        toxicity = float(np.mean(scores)) if scores else 0.0
-        logger.info(f"Toxicity: {toxicity:.3f} for '{text[:40]}...'")
-        return min(max(toxicity, 0.0), 1.0)
-    except Exception as e:
-        logger.warning(f"Toxicity scoring failed: {e}")
-        return 0.0
-
-
-def score_sentiment(text: str) -> Tuple[float, float]:
-    """Score sentiment. Returns (positivity, emotional_intensity)."""
-    if not text or not text.strip():
-        return 0.5, 0.5
-    try:
-        client = get_client()
-        results = client.text_classification(
-            text, model="cardiffnlp/twitter-roberta-base-sentiment-latest"
-        )
-        label_scores = {}
-        for r in results:
-            label = (r.label if hasattr(r, 'label') else r.get('label', '')).lower()
-            score = float(r.score if hasattr(r, 'score') else r.get('score', 0.0))
-            label_scores[label] = score
-        positivity = label_scores.get("positive", 0.5)
-        neutrality = label_scores.get("neutral", 0.3)
-        emotional_intensity = 1.0 - neutrality
-        logger.info(f"Sentiment: pos={positivity:.3f} emo={emotional_intensity:.3f} for '{text[:40]}...'")
-        return (
-            min(max(positivity, 0.0), 1.0),
-            min(max(emotional_intensity, 0.0), 1.0)
-        )
-    except Exception as e:
-        logger.warning(f"Sentiment scoring failed: {e}")
-        return 0.5, 0.5
-
-
-def extract_text_embedding(text: str) -> np.ndarray:
-    """Extract 384-dim text embedding using sentence-transformers."""
-    if not text or not text.strip():
-        return np.zeros(384, dtype=np.float32)
-    try:
-        client = get_client()
-        result = client.feature_extraction(
-            text, model="sentence-transformers/all-MiniLM-L6-v2"
-        )
-        embedding = np.array(result, dtype=np.float32)
-        if embedding.ndim > 1:
-            embedding = embedding.mean(axis=0)
-        # L2 normalize
-        norm = np.linalg.norm(embedding)
-        if norm > 0:
-            embedding = embedding / norm
-        return embedding
-    except Exception as e:
-        logger.warning(f"Text embedding failed: {e}")
-        return np.zeros(384, dtype=np.float32)
 
 
 def decode_base64_image(base64_str: str) -> Image.Image:

@@ -45,63 +45,93 @@ def _get_model():
 
 
 def decode_base64_image(base64_str: str) -> Image.Image:
-    """Decode base64 string to PIL Image."""
+    """Decode base64 string to PIL Image, handling data URI prefixes."""
+    # Strip data URI prefix if present (e.g., 'data:image/jpeg;base64,')
+    if "," in base64_str:
+        base64_str = base64_str.split(",", 1)[1]
+    
     image_bytes = base64.b64decode(base64_str)
     return Image.open(io.BytesIO(image_bytes)).convert("RGB")
 
 
-def analyze_image(image: Image.Image) -> Dict[str, Any]:
+def analyze_collage(collage: Image.Image, aux_context: str = "") -> Dict[str, Any]:
     """
-    Analyze a post screenshot using Gemini 1.5 Flash.
-
-    Returns a dict with:
-      - caption: str — detailed text description of the image
-      - post_type: dict — probability distribution over post categories
-      - dominant_type: str — the most likely post type
+    Analyze a grid collage image of multiple screenshots using Gemini 1.5 Flash.
     """
     model = _get_model()
 
-    prompt = f"""Analyze this social media post screenshot. Return a JSON object with exactly these fields:
+    prompt = f"""You have to analyse a collage image containing multiple mobile screenshots arranged in a grid (2x2, 3x3, or 4x4).
 
-1. "caption": A detailed text description of the image content, including any visible text, people, objects, emotions, and themes. Be descriptive (2-3 sentences).
+Each grid cell represents a separate user screen, mostly from social media apps.
 
-2. "post_type": A JSON object with probability scores (0.0 to 1.0, summing to 1.0) for each category: {json.dumps(POST_CATEGORIES)}. Estimate how likely this post is each type.
+Your job is to extract structured behavioral insights.
 
-Return ONLY valid JSON, no markdown formatting, no code blocks. Example format:
-{{"caption": "A person standing in front of a sunset with text overlay saying motivational quote", "post_type": {{"video": 0.05, "reel": 0.1, "static": 0.6, "text": 0.1, "meme": 0.1, "news": 0.05}}}}"""
+INSTRUCTIONS:
+
+1. Treat each grid cell as an independent screenshot. The cells are numbered in the top-left with a tiny red square.
+2. Do NOT mix contexts between cells.
+3. If text is unclear, infer from visual patterns (UI, thumbnails, layout).
+4. Be concise and structured.
+
+FOR EACH GRID CELL RETURN:
+
+* index: (1 to N, left to right, top to bottom)
+* app: (Instagram, Twitter/X, YouTube, Unknown, etc.)
+* content_type: (reel, post, meme, story, feed, article, etc.)
+* topic: (crypto, entertainment, fitness, news, etc.)
+* engagement_level: (low, medium, high)
+* intent: (learning, scrolling, entertainment, distraction, productivity)
+* brief_summary: (max 10 words)
+
+FINAL OUTPUT:
+
+* dominant_categories: [top 3 topics]
+* overall_behavior: (focused, distracted, mixed)
+* screen_time_quality_score: (1-10)
+* key_pattern: (1 sentence insight about usage pattern)
+
+OUTPUT FORMAT (STRICT JSON ONLY):
+
+{{
+"cells": [
+{{
+"index": 1,
+"app": "",
+"content_type": "",
+"topic": "",
+"engagement_level": "",
+"intent": "",
+"brief_summary": ""
+}}
+],
+"summary": {{
+"dominant_categories": [],
+"overall_behavior": "",
+"screen_time_quality_score": 0,
+"key_pattern": ""
+}}
+}}
+
+IMPORTANT:
+
+* Do not add extra text outside JSON.
+* Do not hallucinate specific names if unclear.
+* Keep outputs consistent and minimal.
+
+Optional additional context from another model: {aux_context}
+"""
 
     try:
-        response = model.generate_content([prompt, image])
+        response = model.generate_content([prompt, collage])
         response_text = response.text.strip()
 
-        # Clean up response — remove markdown code blocks if present
         if response_text.startswith("```"):
             lines = response_text.split("\n")
-            # Remove first and last lines (```json and ```)
             response_text = "\n".join(lines[1:-1]).strip()
 
         result = json.loads(response_text)
-
-        caption = result.get("caption", "")
-        post_type_raw = result.get("post_type", {})
-
-        # Normalize post type distribution
-        post_type = {}
-        total = sum(post_type_raw.values()) if post_type_raw else 1.0
-        for cat in POST_CATEGORIES:
-            score = float(post_type_raw.get(cat, 0.0))
-            post_type[cat] = round(score / max(total, 1e-6), 4)
-
-        dominant_type = max(post_type, key=post_type.get) if post_type else "static"
-
-        logger.info(f"Gemini caption: {caption[:80]}...")
-        logger.info(f"Gemini post type: {dominant_type} ({post_type})")
-
-        return {
-            "caption": caption,
-            "post_type": post_type,
-            "dominant_type": dominant_type
-        }
+        logger.info(f"Collage processed successfully. Extracted {len(result.get('cells', []))} cells.")
+        return result
 
     except json.JSONDecodeError as e:
         logger.error(f"Gemini JSON parse failed: {e}. Raw: {response_text[:200]}")
@@ -113,9 +143,12 @@ Return ONLY valid JSON, no markdown formatting, no code blocks. Example format:
 
 def _fallback_result() -> Dict[str, Any]:
     """Return safe fallback if Gemini fails."""
-    uniform = {cat: round(1.0 / len(POST_CATEGORIES), 4) for cat in POST_CATEGORIES}
     return {
-        "caption": "",
-        "post_type": uniform,
-        "dominant_type": "static"
+        "cells": [],
+        "summary": {
+            "dominant_categories": [],
+            "overall_behavior": "unknown",
+            "screen_time_quality_score": 5,
+            "key_pattern": "Pipeline error occurred."
+        }
     }
